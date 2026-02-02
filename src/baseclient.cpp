@@ -53,87 +53,59 @@ static BaseClient *gClient;
 static std::string gMode = "pool";
 static std::string gRpcUrl = "127.0.0.1:9912";
 
+// Current bitcoin/signals endpoints for disconnect on reconnect (pool mode: sockets created early, only connect/disconnect)
+static std::string gServerBitcoinEndpoint;
+static std::string gSignalsEndpoint;
+
 static bool ConnectBitcoin() {
-	
 	const proto::ServerInfo& sinfo = gServerInfo;
-  LOG_F(INFO, "Connecting to bitcoin: %s:%d ...", sinfo.host().c_str(), sinfo.router());
-	int linger = 0;
+	LOG_F(INFO, "Connecting to bitcoin: %s:%d ...", sinfo.host().c_str(), sinfo.router());
 	char endpoint[256];
-	snprintf(endpoint, sizeof(endpoint), "tcp://%s:%d", sinfo.host().c_str(), sinfo.router());	
-	
-    if(gServer) {
-        zmq_close(gServer);
-        gServer = nullptr;
-    }
+	snprintf(endpoint, sizeof(endpoint), "tcp://%s:%d", sinfo.host().c_str(), sinfo.router());
 
-	gServer = zmq_socket(gCtx, ZMQ_DEALER);
-    if(!gServer) {
-        LOG_F(ERROR, "Failed to create bitcoin socket: %s", zmq_strerror(errno));
-        return false;
-    }
-
-    if(zmq_setsockopt(gServer, ZMQ_LINGER, &linger, sizeof(int)) != 0) {
-        LOG_F(ERROR, "Failed to set ZMQ_LINGER for bitcoin socket: %s", zmq_strerror(errno));
-        zmq_close(gServer);
-        gServer = nullptr;
-        return false;
-    }
-
-	int err = zmq_connect(gServer, endpoint);
-	if(err) {
-    LOG_F(ERROR, "Can't connect to %s:%d (%s code: %d)", sinfo.host().c_str(), sinfo.router(), strerror(errno), errno);
-        zmq_close(gServer);
-        gServer = nullptr;
+	if (!gServer) {
+		LOG_F(ERROR, "Bitcoin socket not created (pool mode init failed?)");
 		return false;
 	}
-	
+	if (gServerBitcoinEndpoint.size() > 0) {
+		zmq_disconnect(gServer, gServerBitcoinEndpoint.c_str());
+		gServerBitcoinEndpoint.clear();
+	}
+	int err = zmq_connect(gServer, endpoint);
+	if (err) {
+		LOG_F(ERROR, "Can't connect to %s:%d (%s code: %d)", sinfo.host().c_str(), sinfo.router(), strerror(errno), errno);
+		return false;
+	}
+	gServerBitcoinEndpoint = endpoint;
 	return true;
 }
 
 static bool ConnectSignals() {
-	
 	const proto::ServerInfo& sinfo = gServerInfo;
-  LOG_F(INFO, "Connecting to signals: %s:%d ...", sinfo.host().c_str(), sinfo.pub());
-	int linger = 0;
+	LOG_F(INFO, "Connecting to signals: %s:%d ...", sinfo.host().c_str(), sinfo.pub());
 	char endpoint[256];
 	snprintf(endpoint, sizeof(endpoint), "tcp://%s:%d", sinfo.host().c_str(), sinfo.pub());
 
-    if(gSignals) {
-        zmq_close(gSignals);
-        gSignals = nullptr;
-    }
-
-	gSignals = zmq_socket(gCtx, ZMQ_SUB);
-    if(!gSignals) {
-        LOG_F(ERROR, "Failed to create signals socket: %s", zmq_strerror(errno));
-        return false;
-    }
-
-    if(zmq_setsockopt(gSignals, ZMQ_LINGER, &linger, sizeof(int)) != 0) {
-        LOG_F(ERROR, "Failed to set ZMQ_LINGER for signals socket: %s", zmq_strerror(errno));
-        zmq_close(gSignals);
-        gSignals = nullptr;
-        return false;
-    }
-
-	int err = zmq_connect(gSignals, endpoint);
-    if(err){
-        LOG_F(ERROR, "Can't connect to %s:%d (%s code: %d)", sinfo.host().c_str(), sinfo.pub(), strerror(errno), errno);
-        zmq_close(gSignals);
-        gSignals = nullptr;
+	if (!gSignals) {
+		LOG_F(ERROR, "Signals socket not created (pool mode init failed?)");
 		return false;
 	}
-	
+	if (gSignalsEndpoint.size() > 0) {
+		zmq_disconnect(gSignals, gSignalsEndpoint.c_str());
+		gSignalsEndpoint.clear();
+	}
+	int err = zmq_connect(gSignals, endpoint);
+	if (err) {
+		LOG_F(ERROR, "Can't connect to %s:%d (%s code: %d)", sinfo.host().c_str(), sinfo.pub(), strerror(errno), errno);
+		return false;
+	}
+	gSignalsEndpoint = endpoint;
 	const char one[2] = {1, 0};
-    if(zmq_setsockopt(gSignals, ZMQ_SUBSCRIBE, one, 1) != 0) {
-        LOG_F(ERROR, "Failed to set ZMQ_SUBSCRIBE for signals socket: %s", zmq_strerror(errno));
-        zmq_close(gSignals);
-        gSignals = nullptr;
-        return false;
-    }
-	
+	if (zmq_setsockopt(gSignals, ZMQ_SUBSCRIBE, one, 1) != 0) {
+		LOG_F(ERROR, "Failed to set ZMQ_SUBSCRIBE for signals socket: %s", zmq_strerror(errno));
+		return false;
+	}
 	return true;
-	
 }
 
 
@@ -491,6 +463,38 @@ int main(int argc, char **argv)
 	gWorkers = zmq_socket(gCtx, ZMQ_PULL);
 	zmq_bind(gWorkers, "inproc://shares");
 
+	// Pool mode: create bitcoin and signals ZMQ sockets and set options before CUDA/mining threads start,
+	// to avoid SIGSEGV in zmq_setsockopt when connecting to pool on RTX 3080 etc.
+	if (gMode == "pool") {
+		int linger = 0;
+		gServer = zmq_socket(gCtx, ZMQ_DEALER);
+		if (!gServer) {
+			LOG_F(ERROR, "Failed to create bitcoin socket: %s", zmq_strerror(errno));
+			exit(EXIT_FAILURE);
+		}
+		if (zmq_setsockopt(gServer, ZMQ_LINGER, &linger, sizeof(int)) != 0) {
+			LOG_F(ERROR, "Failed to set ZMQ_LINGER for bitcoin socket: %s", zmq_strerror(errno));
+			zmq_close(gServer);
+			gServer = nullptr;
+			exit(EXIT_FAILURE);
+		}
+		gSignals = zmq_socket(gCtx, ZMQ_SUB);
+		if (!gSignals) {
+			LOG_F(ERROR, "Failed to create signals socket: %s", zmq_strerror(errno));
+			zmq_close(gServer);
+			gServer = nullptr;
+			exit(EXIT_FAILURE);
+		}
+		if (zmq_setsockopt(gSignals, ZMQ_LINGER, &linger, sizeof(int)) != 0) {
+			LOG_F(ERROR, "Failed to set ZMQ_LINGER for signals socket: %s", zmq_strerror(errno));
+			zmq_close(gSignals);
+			zmq_close(gServer);
+			gSignals = nullptr;
+			gServer = nullptr;
+			exit(EXIT_FAILURE);
+		}
+	}
+
   gClient = createClient(gCtx);
   
   bool benchmarkOnly = false;
@@ -658,10 +662,15 @@ int main(int argc, char **argv)
 		}              
 
     gClient->Toggle();
-		zmq_close(gServer);
-		zmq_close(gSignals);
-		gServer = 0;
-		gSignals = 0;
+		// On disconnect only disconnect, do not close socket; reuse same socket on reconnect to avoid create+setsockopt path on 3080.
+		if (gServerBitcoinEndpoint.size() > 0) {
+			zmq_disconnect(gServer, gServerBitcoinEndpoint.c_str());
+			gServerBitcoinEndpoint.clear();
+		}
+		if (gSignalsEndpoint.size() > 0) {
+			zmq_disconnect(gSignals, gSignalsEndpoint.c_str());
+			gSignalsEndpoint.clear();
+		}
     std::this_thread::sleep_for(std::chrono::seconds(5));
 	}
 	
