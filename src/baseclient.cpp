@@ -203,11 +203,10 @@ static void PrintStats() {
 
 
 static int HandleReply(void *socket) {
-	
 	proto::Reply rep;
-	Receive(rep, socket);
-	
-  if(rep.has_errstr()) {
+	if (!Receive(rep, socket))
+		return 0;
+	if(rep.has_errstr()) {
     LOG_F(ERROR, "Message from server: %s", rep.errstr().c_str());
     gExit = false;
     return -1;
@@ -231,24 +230,29 @@ static int HandleReply(void *socket) {
 		}
 		
 	}else if(rep.type() == proto::Request::SHARE){
-    auto currentTime = std::chrono::steady_clock::now();
-    auto info = gSharesSent[rep.reqid()];
-    auto ms = static_cast<unsigned>(std::chrono::duration_cast<std::chrono::milliseconds>(currentTime-info.time).count());
-		gSharesSent.erase(rep.reqid());
+		auto it = gSharesSent.find(rep.reqid());
+		if (it == gSharesSent.end())
+			return 0;
+		shareData info = it->second;
+		gSharesSent.erase(it);
+
+		auto currentTime = std::chrono::steady_clock::now();
+		auto ms = static_cast<unsigned>(std::chrono::duration_cast<std::chrono::milliseconds>(currentTime - info.time).count());
+		unsigned len = static_cast<unsigned>(info.length >= 0 ? info.length : 0);
 
 		switch(rep.error()){
 		case proto::Reply::NONE:
-      LOG_F(1, "Share accepted %ums", ms);
+			LOG_F(1, "Share accepted %ums", ms);
 			gStaleShareChain = 0;
-      gShares[info.length].accepted++;
+			gShares[len].accepted++;
 			break;
 		case proto::Reply::INVALID:
-      LOG_F(WARNING, "Invalid share %ums", ms);
-      gShares[info.length].invalid++;
+			LOG_F(WARNING, "Invalid share %ums", ms);
+			gShares[len].invalid++;
 			break;
 		case proto::Reply::STALE:
-      LOG_F(WARNING, "Stale share %ums", ms);
-      gShares[info.length].stale++;
+			LOG_F(WARNING, "Stale share %ums", ms);
+			gShares[len].stale++;
 			gStaleShareChain++;
 			if (gStaleShareChain >= 4) {
 				gStaleShareChain = 0;
@@ -257,13 +261,13 @@ static int HandleReply(void *socket) {
 			}
 			break;
 		case proto::Reply_ErrType_DUPLICATE:
-      LOG_F(WARNING, "Duplicate share");
-      gShares[info.length].duplicate++;
+			LOG_F(WARNING, "Duplicate share");
+			gShares[len].duplicate++;
 			break;
 		default: break;
 		}
 
-    gLatency = ms;
+		gLatency = ms;
 	}else if(rep.type() == proto::Request::STATS){
 		
     if(rep.error() == proto::Reply::NONE) {
@@ -463,33 +467,18 @@ int main(int argc, char **argv)
 	gWorkers = zmq_socket(gCtx, ZMQ_PULL);
 	zmq_bind(gWorkers, "inproc://shares");
 
-	// Pool mode: create bitcoin and signals ZMQ sockets and set options before CUDA/mining threads start,
-	// to avoid SIGSEGV in zmq_setsockopt when connecting to pool on RTX 3080 etc.
+	// Pool mode: create bitcoin and signals ZMQ sockets before CUDA/mining threads start.
+	// Do NOT call zmq_setsockopt here: on RTX 3080 etc. it can SIGSEGV in libzmq; use default options.
 	if (gMode == "pool") {
-		int linger = 0;
 		gServer = zmq_socket(gCtx, ZMQ_DEALER);
+		gSignals = zmq_socket(gCtx, ZMQ_SUB);
 		if (!gServer) {
 			LOG_F(ERROR, "Failed to create bitcoin socket: %s", zmq_strerror(errno));
 			exit(EXIT_FAILURE);
 		}
-		if (zmq_setsockopt(gServer, ZMQ_LINGER, &linger, sizeof(int)) != 0) {
-			LOG_F(ERROR, "Failed to set ZMQ_LINGER for bitcoin socket: %s", zmq_strerror(errno));
-			zmq_close(gServer);
-			gServer = nullptr;
-			exit(EXIT_FAILURE);
-		}
-		gSignals = zmq_socket(gCtx, ZMQ_SUB);
 		if (!gSignals) {
 			LOG_F(ERROR, "Failed to create signals socket: %s", zmq_strerror(errno));
 			zmq_close(gServer);
-			gServer = nullptr;
-			exit(EXIT_FAILURE);
-		}
-		if (zmq_setsockopt(gSignals, ZMQ_LINGER, &linger, sizeof(int)) != 0) {
-			LOG_F(ERROR, "Failed to set ZMQ_LINGER for signals socket: %s", zmq_strerror(errno));
-			zmq_close(gSignals);
-			zmq_close(gServer);
-			gSignals = nullptr;
 			gServer = nullptr;
 			exit(EXIT_FAILURE);
 		}
